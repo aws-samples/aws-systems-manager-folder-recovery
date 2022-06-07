@@ -1,0 +1,377 @@
+Parameters:
+  VPC:
+    Description: Which VPC should the temporary instance be launched?
+    Type: AWS::EC2::VPC::Id
+  Subnet:
+    Description: Which subnet should the temporary instance be launched?
+    Type: AWS::EC2::Subnet::Id
+  S3RecoveredBucket:
+    Description: The bucket where you would like the recovered zip files stored.
+    Type: String
+  DefaultInstanceClass:
+    Description: What instance type would you like to use by default?
+    Type: String
+    Default: t3.medium
+    AllowedValues: 
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+
+Resources:
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Individual File Recovery
+      SecurityGroupIngress: []
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+          Description: "To install updates"
+  ManagedInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ManagedInstanceRole
+
+  ManagedInstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Path: /
+      Policies:
+        - PolicyName: S3AllowPutForRecoveredFiles
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              Action:
+                - 's3:PutObject'
+              Effect: Allow
+              Resource: 
+                - !Sub 'arn:aws:s3:::${S3RecoveredBucket}'
+                - !Sub 'arn:aws:s3:::${S3RecoveredBucket}/*'
+        - PolicyName: AllowEC2Actions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:DetachVolume"
+                  - "ec2:AttachVolume"
+                  - "ec2:DeleteVolume"
+                  - "ec2:CreateVolume"
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:volume/*'
+                  - !Sub 'arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*'
+              - Effect: Allow
+                Action:
+                  - "ec2:DescribeVolumes"
+                Resource: '*'
+
+  AutomationDocWindows:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: "Automated-Windows-Folder-Recovery"
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        description: Main orchestration document for restoring individual folders from a snapshot backup.
+        schemaVersion: '0.3'
+        parameters:
+          SnapshotId:
+            type: String
+            description: "(Required) The SnapshotId you would like to recover files from"
+          RecoverFolder:
+            type: String
+            description: "(Required) The relative path from the mount point"
+          S3RecoveredBucket:
+            type: String
+            description: "(Required) The bucket where you would like the zip of the folder recovered uploaded"
+            default: !Ref S3RecoveredBucket
+          DefaultInstanceClass:
+            type: String
+            description: What instance type would you like to use by default?
+            default: !Ref DefaultInstanceClass
+          RecoveryOS:
+            type: String
+            description: >-
+              (Windows) - /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+              (Linux) - /aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+            default: /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base
+          SubnetId:
+            type: String
+            description: This was set by the deployed CloudFormation Template, please modify there.
+            default: !Ref Subnet
+          SecurityGroupId:
+            type: String
+            description: This was set by the deployed CloudFormation Template, please modify there.
+            default: !Ref SecurityGroup
+        mainSteps:
+          - name: GetAMIParam
+            action: 'aws:executeAwsApi'
+            maxAttempts: 1
+            inputs:
+              Service: ssm
+              Api: GetParameter
+              Name: '{{ RecoveryOS }}'
+            outputs:
+              - Name: ssmAMI
+                Type: String
+                Selector: $.Parameter.Value
+          - name: LaunchInstance
+            action: 'aws:runInstances'
+            timeoutSeconds: 3600
+            maxAttempts: 1
+            onFailure: Abort
+            inputs:
+              ImageId: '{{ GetAMIParam.ssmAMI }}'
+              InstanceType: !Ref DefaultInstanceClass
+              MinInstanceCount: 1
+              MaxInstanceCount: 1
+              SubnetId: '{{ SubnetId }}'
+              SecurityGroupIds:
+                - '{{ SecurityGroupId }}'
+              IamInstanceProfileName: !Ref ManagedInstanceProfile
+          - name: InstallPreReq
+            action: "aws:runCommand"
+            timeoutSeconds: 120
+            onFailure: step:TerminateFirstInstance
+            inputs:
+              DocumentName: AWS-RunPowerShellScript
+              InstanceIds:
+                - '{{ LaunchInstance.InstanceIds }}'
+              Parameters:
+                commands: |-
+                  mkdir c:/awscli
+                  $WebDownloader = New-Object System.Net.WebClient
+                  $WebDownloader.DownloadFile("https://awscli.amazonaws.com/AWSCLIV2.msi","C:/awscli/awscliv2.msi")
+                  Start-Process msiexec.exe -Wait -ArgumentList "/i c:\awscli\awscliv2.msi /qn /l*v c:\awscli\aws-cli-install.log"
+                  Restart-Computer
+          - name: WindowsRecovery
+            action: "aws:runCommand"
+            timeoutSeconds: 600
+            onFailure: step:TerminateFirstInstance
+            inputs:
+              DocumentName: AWS-RunPowerShellScript
+              InstanceIds:
+                - '{{ LaunchInstance.InstanceIds }}'
+              Parameters:
+                commands: |-
+                  try {
+                    $INSTANCE_ID = (Invoke-RestMethod http://169.254.169.254/latest/meta-data/instance-id)
+                    $AVAIL_ZONE = (Invoke-RestMethod http://169.254.169.254/latest/meta-data/placement/availability-zone)
+                    $REGION = (Invoke-RestMethod http://169.254.169.254/latest/dynamic/instance-identity/document).region
+                    $SNAPSHOT_ID = "{{ SnapshotId }}"
+                    $RECOV_FOLDER = "{{ RecoverFolder }}"
+                    $RECOV_FOLDER.replace("\","/")
+                    $S3_BUCKET = "{{ S3RecoveredBucket }}"
+                    cd ~
+                    Invoke-WebRequest -Uri https://github.com/stedolan/jq/releases/download/jq-1.6/jq-win64.exe -OutFile jq.exe
+                    Write-Host "--> Creating volume"
+                    $VOLUME_ID=$(aws ec2 create-volume --snapshot-id $SNAPSHOT_ID --availability-zone $AVAIL_ZONE --region $REGION | ~/jq -r ".VolumeId")
+                    Write-Host "--> Waiting for volume creation: $VOLUME_ID"
+                    aws ec2 wait volume-available --volume-ids $VOLUME_ID --region $REGION
+                    Write-Host "--> Attaching volume"
+                    aws ec2 attach-volume --instance-id $INSTANCE_ID --device /dev/sda2 --volume-id $VOLUME_ID --region $REGION
+                    while ($(aws ec2 describe-volumes --region $REGION --volume-ids $VOLUME_ID |~/jq -r ".Volumes[].Attachments[].State") -ne "attached")
+                    {
+                        Write-Host "Not Attached"
+                        Start-Sleep -Seconds 5
+                    }
+                    Write-Host "--> Bringing disk online"
+                    Get-Disk | Where-Object IsOffline -Eq $True | Set-Disk -IsOffline $False
+                    Write-Host "--> Zipping folder: d:/$RECOV_FOLDER"
+                    $NOW_TIME=$(Get-Date -Format "HH-mm-ss")
+                    $FILE_NAME="recovered_folder_$($NOW_TIME).zip"
+                    Compress-Archive -Path d:/$RECOV_FOLDER -DestinationPath ./$FILE_NAME
+                    Write-Host "--> Detaching Volume"
+                    aws ec2 detach-volume --force --instance-id $INSTANCE_ID --volume-id $VOLUME_ID --region $REGION
+                    Write-Host "--> Waiting for detachment"
+                    aws ec2 wait volume-available --volume-ids $VOLUME_ID --region $REGION
+                    Write-Host "--> Deleting volume: $VOLUME_ID"
+                    aws ec2 delete-volume --volume-id $VOLUME_ID --region $REGION
+                    Write-Host "--> Copying zip to S3 bucket"
+                    $NOW_DATE=$(Get-Date -UFormat "%Y-%m-%d")
+                    aws s3 cp ./$FILE_NAME s3://$S3_BUCKET/$NOW_DATE/
+                  } catch {
+                    Write-Host  "Failed to retrieve folder from backup."
+                    Write-Error  $Error[0]  -ErrorAction Continue
+                    exit 42
+                  }
+          - name: TerminateFirstInstance
+            action: 'aws:changeInstanceState'
+            timeoutSeconds: 1200
+            maxAttempts: 1
+            isEnd: true
+            inputs:
+              InstanceIds:
+                - '{{ LaunchInstance.InstanceIds }}'
+              DesiredState: terminated
+
+  AutomationDocLinux:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: "Automated-Linux-Folder-Recovery"
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        description: Main orchestration document for restoring individual folders from a snapshot backup.
+        schemaVersion: '0.3'
+        parameters:
+          SnapshotId:
+            type: String
+            description: "(Required) The SnapshotId you would like to recover files from"
+          RecoverFolder:
+            type: String
+            description: "(Required) The relative path from the mount point"
+          S3RecoveredBucket:
+            type: String
+            description: "(Required) The bucket where you would like the zip of the folder recovered uploaded"
+            default: !Ref S3RecoveredBucket
+          DefaultInstanceClass:
+            type: String
+            description: What instance type would you like to use by default?
+            default: !Ref DefaultInstanceClass
+          PartitionNumber:
+            description: Please indicate the partition number where the data is stored in volume being recovered.
+            type: String
+            default: "1"
+          RecoveryOS:
+            type: String
+            description: >-
+              (Windows) - /aws/service/ami-windows-latest/Windows_Server-2019-English-Full-Base  
+              (Linux) - /aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+            default: /aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+          SubnetId:
+            type: String
+            description: This was set by the deployed CloudFormation Template, please modify there.
+            default: !Ref Subnet
+          SecurityGroupId:
+            type: String
+            description: This was set by the deployed CloudFormation Template, please modify there.
+            default: !Ref SecurityGroup
+        mainSteps:
+          - name: GetAMIParam
+            action: 'aws:executeAwsApi'
+            maxAttempts: 1
+            inputs:
+              Service: ssm
+              Api: GetParameter
+              Name: '{{ RecoveryOS }}'
+            outputs:
+              - Name: ssmAMI
+                Type: String
+                Selector: $.Parameter.Value
+          - name: LaunchInstance
+            action: 'aws:runInstances'
+            timeoutSeconds: 3600
+            maxAttempts: 1
+            onFailure: Abort
+            inputs:
+              ImageId: '{{ GetAMIParam.ssmAMI }}'
+              InstanceType: 't3.medium'
+              MinInstanceCount: 1
+              MaxInstanceCount: 1
+              SubnetId: '{{ SubnetId }}'
+              SecurityGroupIds:
+                - '{{ SecurityGroupId }}'
+              IamInstanceProfileName: !Ref ManagedInstanceProfile
+          - name: InstallPreReq
+            action: "aws:runCommand"
+            timeoutSeconds: 120
+            onFailure: step:TerminateFirstInstance
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - '{{ LaunchInstance.InstanceIds }}'
+              Parameters:
+                commands:
+                  - '#!/bin/bash'
+                  - 'sudo su -'
+                  - 'apt-get update'
+                  - 'apt-get install jq awscli zip -y'
+          - name: LinuxRecovery
+            action: "aws:runCommand"
+            timeoutSeconds: 600
+            onFailure: step:TerminateFirstInstance
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - '{{ LaunchInstance.InstanceIds }}'
+              Parameters:
+                commands: |-
+                  #!/bin/bash
+                  SNAPSHOT_ID="{{ SnapshotId }}"
+                  PARTITION_NUM="{{ PartitionNumber }}"
+                  RECOV_FOLDER="{{ RecoverFolder }}"
+                  S3_BUCKET="{{ S3RecoveredBucket }}"
+                  INSTANCE_ID="`wget -q -O - http://169.254.169.254/latest/meta-data/instance-id || die \"wget cannot get instance-id: $?\"`"
+                  test -n ${INSTANCE_ID} || die "Cannot get instance-id"
+                  AVAIL_ZONE="`wget -q -O - http://169.254.169.254/latest/meta-data/placement/availability-zone || die \"wget cannot get AZ: $?\"`"
+                  test -n ${AVAIL_ZONE} || die "Cannot get AZ"
+                  REGION="`echo \"$AVAIL_ZONE\" | sed -e "s:\([0-9][0-9]*\)[a-z]*\$:\\1:" || die \"wget cannot get Region: $?\"`"
+                  test -n ${REGION} || die "Cannot get Region"
+                  echo "--> Creating volume"
+                  VOLUME_ID=`aws ec2 create-volume --snapshot-id ${SNAPSHOT_ID} --availability-zone ${AVAIL_ZONE} --region ${REGION} | jq -r ".VolumeId" || die \"Cannot create volume from snapshot: $?\"`
+                  test -n ${VOLUME_ID} || die "volume not created"
+                  echo "--> Waiting for volume creation: ${VOLUME_ID}"
+                  aws ec2 wait volume-available --volume-ids ${VOLUME_ID} --region ${REGION}
+                  echo "--> Attaching volume"
+                  aws ec2 attach-volume --instance-id ${INSTANCE_ID} --device /dev/sdf --volume-id ${VOLUME_ID} --region ${REGION}
+                  echo "--> Waiting for volume attachment"
+                  while :
+                  do
+                      echo "Not Attached"
+                      if [[ $(aws ec2 describe-volumes --region ${REGION} --volume-ids ${VOLUME_ID} |jq -r ".Volumes[].Attachments[].State") = attached ]]
+                      then
+                          break
+                      fi
+                      sleep 5
+                  done
+                  echo "--> Mounting volume to: /data"
+                  sudo mkdir /data
+                  sudo mount /dev/nvme1n1p1 /data
+                  echo "--> Zipping folder: /data/${RECOV_FOLDER}"
+                  cd /data/${RECOV_FOLDER}
+                  NOW_TIME=`date +"%H-%M-%S"`
+                  FILE_NAME="recovered_folder_"${NOW_TIME}".zip"
+                  zip -r ~/${FILE_NAME} *
+                  cd ~
+                  echo "--> Unmounting Drive"
+                  sudo umount /data
+                  sudo rmdir /data
+                  echo "--> Detaching Volume"
+                  aws ec2 detach-volume --instance-id ${INSTANCE_ID} --volume-id ${VOLUME_ID} --region ${REGION}
+                  echo "--> Waiting for detachment"
+                  aws ec2 wait volume-available --volume-ids ${VOLUME_ID} --region ${REGION}
+                  echo "--> Deleting volume: ${VOLUME_ID}"
+                  aws ec2 delete-volume --volume-id ${VOLUME_ID} --region ${REGION}
+                  echo "--> Copying zip to S3 bucket"
+                  NOW_DATE=`date +"%Y-%m-%d"`
+                  aws s3 cp ~/${FILE_NAME} s3://${S3_BUCKET}/${NOW_DATE}/
+          - name: TerminateFirstInstance
+            action: 'aws:changeInstanceState'
+            timeoutSeconds: 1200
+            maxAttempts: 1
+            isEnd: true
+            inputs:
+              InstanceIds:
+                - '{{ LaunchInstance.InstanceIds }}'
+              DesiredState: terminated
